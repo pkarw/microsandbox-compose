@@ -1,7 +1,5 @@
-import * as child_process from 'child_process';
 import { ComposeProject, ComposeService } from './types';
-
-const { exec, execSync } = child_process;
+import { createProjectNetwork, runMsb } from './msb';
 
 type PortMapping = {
   bindAddress?: string;
@@ -72,15 +70,15 @@ function topologicalSort(services: Record<string, ComposeService>): string[] {
     graph[name] = [];
   }
 
-  // Build graph edges
+  // Build graph edges. A `depends_on` that points at a service not in the
+  // active set (e.g. gated off by `--profile`) just yields no edge: compose
+  // treats depends_on as an ordering hint, never a start prerequisite.
   for (const [name, service] of Object.entries(services)) {
     if (service.depends_on) {
       for (const dep of service.depends_on) {
         if (dep in services) {
           graph[dep].push(name);
           in_degree[name]++;
-        } else {
-          throw new Error(`Service ${name} depends on non-existent service: ${dep}`);
         }
       }
     }
@@ -110,7 +108,7 @@ function topologicalSort(services: Record<string, ComposeService>): string[] {
   return sorted;
 }
 
-export function handleUpCommand(composeData: ComposeProject, options: { file: string, profile?: string }) {
+export async function handleUpCommand(composeData: ComposeProject, options: { file: string, profile?: string }) {
   const projectName = composeData.name || 'default-project';
   const activeProfiles = options.profile ? options.profile.split(',') : [];
 
@@ -161,22 +159,8 @@ export function handleUpCommand(composeData: ComposeProject, options: { file: st
     serviceOrder = topologicalSort(activeServices);
   }
 
-  // Create internal network for project
-  let networkId = null;
-  try {
-    const stdout = execSync(`msb network create ${projectName} --internal 2>&1`, { stdio: ['pipe', 'pipe', 'pipe'] });
-    if (stdout.includes('already exists')) {
-      console.log('Network already exists, reusing');
-    } else {
-      console.log('Created network:', stdout.trim());
-    }
-  } catch (error: any) {
-    if (error.stderr.includes('already exists')) {
-      console.log('Network already exists, reusing');
-    } else {
-      throw new Error(`Failed to create network: ${error.stderr}`);
-    }
-  }
+  // Create internal network for project (shared across all sandboxes)
+  createProjectNetwork(projectName);
 
   // Start services in dependency order
   for (const serviceName of serviceOrder) {
@@ -224,13 +208,14 @@ export function handleUpCommand(composeData: ComposeProject, options: { file: st
 
     console.log(`Starting service: ${serviceName}`);
     console.log(`Command: ${command}`);
-    
-    exec(command, (error, stdout, stderr) => {
-      if (error) {
-        console.error(`Error for ${serviceName}:`, stderr);
-        process.exit(1);
-      }
-      console.log(`${serviceName} started successfully`);
-    });
+
+    try {
+      await runMsb(command);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`Error starting ${serviceName}: ${message}`);
+      process.exit(1);
+    }
+    console.log(`${serviceName} started successfully`);
   }
 }
